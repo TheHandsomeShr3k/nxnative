@@ -32,6 +32,16 @@ static void finish(NVNsync *sync) {
     require(landed(sync, 5000000000ull), "queue tail and GPU work complete");
     P(nvnSyncFinalize)(sync);
 }
+// A submitted job is physically encoded once its queue prefix is scheduled (event
+// scheduler) or it took the direct path, whose fence is a GPU fence at once.
+static int queue_encoded(NVNsync *sync) {
+    pthread_mutex_lock(&g_sub_mu);
+    const sync_t *st = (const sync_t *)sync;
+    int encoded = st->fenced == NVN_SYNC_FENCE_GPU ||
+                  (st->fenced == NVN_SYNC_FENCE_QUEUE_PREFIX && g_qs && nvn_qs_scheduled(g_qs, (nvn_qs_ticket){st->queue, st->fence}));
+    pthread_mutex_unlock(&g_sub_mu);
+    return encoded;
+}
 static int pixels(unsigned offset, unsigned r, unsigned g, unsigned b) {
     const uint8_t want[] = {r, g, b, 255};
     for (int i = 0; i < W * H; i++) if (memcmp(memory + OUTPUT + offset + i * 4, want, 4)) return 0;
@@ -116,19 +126,41 @@ int main(void) { @autoreleasepool {
         CHECK(pixels(0,0,0,255),names[k]);
     }
     // No object or backing reuse: only the queue-owned render-enable state crosses jobs.
-    submit(0,record(&target,NULL,0,0,0),&sync);finish(&sync);
+    // A continuation parked on an event keeps its queue's disabled state while another
+    // queue's job runs in between; a new submission starts with rendering enabled.
+    NVNevent gate; NVNeventBuilder gb = {0}; P(nvnEventBuilderSetDefaults)(&gb); P(nvnEventBuilderSetStorage)(&gb, &pool, EVENT + 0x800);
+    require(P(nvnEventInitialize)(&gate, &gb), "gate event initialized");
+    P(nvnEventSignal)(&gate, NVN_EVENT_SIGNAL_MODE_WRITE, 0);
+    NVNsync parked;
+    P(nvnCommandBufferBeginRecording)(&command);
+    P(nvnCommandBufferSetRenderEnable)(&command,1);
+    P(nvnCommandBufferSetRenderTargets)(&command,1,colors,NULL,NULL,NULL);
+    P(nvnCommandBufferSetViewports)(&command,0,1,viewport); P(nvnCommandBufferSetScissor)(&command,0,0,W,H);
+    P(nvnCommandBufferClearColor)(&command,0,blue,15);
+    P(nvnCommandBufferBindProgram)(&command,&stable_red,3);
+    P(nvnCommandBufferSetRenderEnable)(&command,0);
+    P(nvnCommandBufferWaitEvent)(&command,&gate,NVN_EVENT_WAIT_MODE_EQUAL,1);
+    P(nvnCommandBufferDrawArrays)(&command,NVN_DRAW_PRIMITIVE_TRIANGLES,0,3);
+    P(nvnCommandBufferSetRenderEnable)(&command,1);
+    P(nvnCommandBufferCopyTextureToBuffer)(&command,&target,NULL,&region,output,0);
+    submit(0,P(nvnCommandBufferEndRecording)(&command),&parked);
+    CHECK(!queue_encoded(&parked),"queue parks on its unsignaled event");
+    submit(1,record(&replacement,&stable_green,0,1,BYTES),&sync);finish(&sync);
+    CHECK(pixels(BYTES,0,255,0),"independent queue draws with its default enabled state while the other waits");
+    P(nvnEventSignal)(&gate, NVN_EVENT_SIGNAL_MODE_WRITE, 1);
+    finish(&parked);
+    CHECK(pixels(0,0,0,255),"continuation keeps its queue's disabled state across another queue's job");
     P(nvnCommandBufferBeginRecording)(&command);
     P(nvnCommandBufferSetRenderEnable)(&command,0);
     submit(0,P(nvnCommandBufferEndRecording)(&command),&sync);finish(&sync);
-    submit(1,record(&replacement,&stable_green,0,1,BYTES),&sync);finish(&sync);
-    CHECK(pixels(BYTES,0,255,0),"independent queue draws with its default enabled state");
     P(nvnCommandBufferBeginRecording)(&command);
     P(nvnCommandBufferBindProgram)(&command,&stable_red,3);
     P(nvnCommandBufferDrawArrays)(&command,NVN_DRAW_PRIMITIVE_TRIANGLES,0,3);
     P(nvnCommandBufferCopyTextureToBuffer)(&command,&target,NULL,&region,output,0);
     P(nvnCommandBufferSetRenderEnable)(&command,1);
     submit(0,P(nvnCommandBufferEndRecording)(&command),&sync);finish(&sync);
-    CHECK(pixels(0,0,0,255),"original queue retains disabled state after another queue runs");
+    CHECK(pixels(0,255,0,0),"a new submission on the original queue starts with rendering enabled");
+    P(nvnEventFinalize)(&gate);
 
     // Hold GPU completion while the real NVN recorder/replayer crosses a fence.
     // The render predicate must forward the pending timestamp's known counter0.
@@ -153,9 +185,7 @@ int main(void) { @autoreleasepool {
     submit(0,P(nvnCommandBufferEndRecording)(&command),&sync);
     uint64_t deadline=now_ns()+1000000000ull;int encoded=0;
     do {
-        pthread_mutex_lock(&nq_mu);
-        sync_t *st=(sync_t *)&sync;encoded=st->fenced==3 && ((nq_receipt *)(uintptr_t)st->fence)->published;
-        pthread_mutex_unlock(&nq_mu);
+        encoded=queue_encoded(&sync);
         if(!encoded) usleep(1000);
     } while(!encoded && now_ns()<deadline);
     CHECK(encoded,"both physical chunks encode while GPU completion is gated");

@@ -36,6 +36,24 @@ void mtl_res_snapshot(mtl_res_count *out);
 // One submit: begin -> several operations -> commit (returns the fence value at which this submit completes)
 void mtl_prepare(void);                                // the first submission's prepare step (prewarm, pipeline prebuild): no GPU work, called outside the graphics gate
 void mtl_sub_begin(void);
+void mtl_queue_seal(void);                         // own persistent target snapshots before record retirement
+void mtl_sub_resume(void);                         // continuation after a guest event boundary
+// Serialized by the submit lock. Event chunks append to one allocator lease;
+// pressure may revoke its completed prefix so blocked submissions cannot pin
+// the bounded allocator pool forever. Unencoded continuations reacquire it.
+typedef struct mtl_submit_alloc mtl_submit_alloc;
+mtl_submit_alloc *mtl_submit_alloc_new(void);
+void mtl_submit_alloc_close(mtl_submit_alloc *alloc); // last chunk committed, or owner released
+void mtl_submit_alloc_release(mtl_submit_alloc *alloc);
+void mtl_sub_begin_alloc(mtl_submit_alloc *alloc, int resume);
+// Submission-mode timestamps share one clock across host event chunks. The
+// logical submission owns the token; set_clock retains it until completion.
+// Segment-mode GPU timestamps and direct submits without a token are unchanged.
+typedef struct mtl_submit_clock mtl_submit_clock;
+mtl_submit_clock *mtl_submit_clock_new(void);
+void mtl_submit_clock_release(mtl_submit_clock *clock);
+void mtl_sub_set_clock(mtl_submit_clock *clock);    // after begin/resume, before encoding reports
+uint64_t mtl_completed_fence(void);                // post-operations are visible through this fence
 void mtl_queue_activate(uint64_t serial);              // submit lock held: restore this queue's persistent GPU state
 void mtl_queue_forget(uint64_t serial);                // finalize: discard its state, including guest object pointers
 void mtl_sub_copy(uint64_t src, uint64_t dst, uint64_t n);               // Buffer copy in GPU ordering
@@ -43,7 +61,6 @@ void mtl_sub_event(volatile uint32_t *val, uint32_t mode, uint32_t v);   // Writ
 void mtl_sub_counter(uint64_t addr, uint32_t type);                       // Write the counter record after completion
 uint64_t mtl_sub_commit(void);
 
-uint64_t mtl_completed_fence(void);                 // Completed physical submissions, including CPU-visible post effects
 uint64_t mtl_last_fence(void);                       // Fence value of the most recent submit (0 = never submitted)
 int mtl_wait(uint64_t fence, uint64_t timeout_ns);   // Returns 1 when the GPU has completed up to fence, 0 on timeout
 int mtl_wait_acq(uint64_t fence, uint64_t timeout_ns);   // the same for a sync WindowAcquireTexture handed out (its own line in the wait ledger, DM_NVN_WAITS)

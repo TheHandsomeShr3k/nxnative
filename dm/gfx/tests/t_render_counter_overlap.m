@@ -34,6 +34,16 @@ static void finish(NVNsync *sync) {
     require(landed(sync, 5000000000ull), "queue tail and GPU work complete");
     P(nvnSyncFinalize)(sync);
 }
+// A submitted job is physically encoded once its queue prefix is scheduled (event
+// scheduler) or it took the direct path, whose fence is a GPU fence at once.
+static int queue_encoded(NVNsync *sync) {
+    pthread_mutex_lock(&g_sub_mu);
+    const sync_t *st = (const sync_t *)sync;
+    int encoded = st->fenced == NVN_SYNC_FENCE_GPU ||
+                  (st->fenced == NVN_SYNC_FENCE_QUEUE_PREFIX && g_qs && nvn_qs_scheduled(g_qs, (nvn_qs_ticket){st->queue, st->fence}));
+    pthread_mutex_unlock(&g_sub_mu);
+    return encoded;
+}
 static int pixels(unsigned offset, unsigned r, unsigned g, unsigned b) {
     const uint8_t want[] = {r, g, b, 255};
     for (int i = 0; i < W * H; i++) if (memcmp(memory + OUTPUT + offset + i * 4, want, 4)) return 0;
@@ -93,6 +103,11 @@ int main(void) { @autoreleasepool {
     NVNsync sync, split;P(nvnSyncInitialize)(&split,&device);
     const NVNtexture *colors[]={&target};const float blue[]={0,0,1,1},red_clear[]={1,0,0,1};
     const char *names[]={"UpdateUB1", "UpdateUB1 then fence", "ClearBuffer1", "CopyBuffer1", "CopyBuffer0", "UpdateUB high32"};
+    // Pass 0 replays each submission as one Metal submission (no event wait recorded yet);
+    // pass 1 forces the event scheduler, which splits at every recorded FenceSync.
+    for(int pass=0;pass<2;pass++) {
+    if(pass) atomic_store(&g_event_waits,1);
+    printf("pass: %s\n",pass?"event scheduler chunks":"direct submission");
     for(int k=0;k<6;k++) {
         id<MTLSharedEvent> gate=[g_dev newSharedEvent];
         dispatch_semaphore_t cancel=dispatch_semaphore_create(0), retired=dispatch_semaphore_create(0);
@@ -124,9 +139,7 @@ int main(void) { @autoreleasepool {
         submit(0,P(nvnCommandBufferEndRecording)(&command),&sync);
         uint64_t deadline=now_ns()+1000000000ull;int encoded=0;
         do {
-            pthread_mutex_lock(&nq_mu);sync_t *st=(sync_t *)&sync;
-            encoded=st->fenced==3 && ((nq_receipt *)(uintptr_t)st->fence)->published;
-            pthread_mutex_unlock(&nq_mu);if(!encoded)usleep(1000);
+            encoded=queue_encoded(&sync);if(!encoded)usleep(1000);
         }while(!encoded && now_ns()<deadline);
         CHECK(encoded,"overlap commands encode while GPU completion gated");
         gate.signaledValue=1;dispatch_semaphore_signal(cancel);
@@ -136,6 +149,7 @@ int main(void) { @autoreleasepool {
         CHECK(good,names[k]);if(k!=5) CHECK(*gpu_value==want,"GPU command-ordered bytes match latest full write");
         else printf("OPEN partial-update native GPU_A expected=%#llx actual=%#llx: timestamp report is currently CPU-post only\n",(unsigned long long)want,(unsigned long long)*gpu_value);
         printf("RESULT %s predicate=%d GPU_A=%#llx final_CPU_A=%#llx expected=%#llx\n",names[k],good,(unsigned long long)*gpu_value,(unsigned long long)counts[0],(unsigned long long)want);
+    }
     }
     P(nvnSyncFinalize)(&split);
     P(nvnQueueFinish)(&queues[0]); P(nvnQueueFinish)(&queues[1]);

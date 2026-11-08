@@ -55,14 +55,35 @@ typedef struct { uint32_t magic; samp_par p; } samp_t;                          
 // The per-stage shader keys are not kept in prog_t: the game's real NVNprogram may be smaller than the header's 0xC0 (growing prog_t corrupted the adjacent object in Mario); see prog_keys in hle_nvn.c
 typedef struct { uint32_t magic, nstage; NVNshaderData sd[6]; uint64_t serial; } prog_t;     FITS(prog_t, NVNprogram);   // serial: table key for the replay layer's resolved result
 
-typedef struct { uint32_t magic, fenced; uint64_t fence; } sync_t;   /* fenced 1: physical, 2: acquire, 3: owned logical receipt */                           FITS(sync_t, NVNsync);
+enum {
+    NVN_SYNC_FENCE_NONE = 0,
+    NVN_SYNC_FENCE_GPU = 1,
+    NVN_SYNC_FENCE_ACQUIRE = 2,
+    NVN_SYNC_FENCE_QUEUE_PREFIX = 3,
+    NVN_SYNC_FENCE_RECORDED_PENDING = 4,
+};
+typedef struct {
+    uint32_t magic, fenced;
+    uint64_t fence; // GPU fence, or logical sequence for NVN_SYNC_FENCE_QUEUE_PREFIX
+    uint64_t queue; // queue serial for a logical sequence
+} sync_t;
+FITS(sync_t, NVNsync);
 typedef struct { const pool_t *pool; int64_t off; } ev_builder_t;                             FITS(ev_builder_t, NVNeventBuilder);
 typedef struct { uint32_t magic; volatile uint32_t *val; const pool_t *pool; int64_t off; } ev_t; FITS(ev_t, NVNevent);   // pool / off: EventGetMemoryPool / Offset
 
 typedef struct { NVNdevice *dev; void *native; int32_t ntex, interval; NVNtexture *tex[4]; } win_builder_t;
 FITS(win_builder_t, NVNwindowBuilder);
 // avail[i]: time at which swapchain image i can be acquired again (ns, monotonic clock) = its display time + one present period; pace: target time of this window's present pacer
-typedef struct { uint32_t magic; void *native; int32_t ntex, interval, next, crop[4]; NVNtexture *tex[4]; uint64_t presents, avail[4], pace, ticket[4]; } win_t;   // ticket[i]: ticket of the most recent present of image i
+typedef struct {
+    uint32_t magic;
+    void *native;
+    int32_t ntex, interval, next, crop[4];
+    NVNtexture *tex[4];
+    uint64_t presents, avail[4], pace;
+    uint64_t ticket[4];       // most recent present ticket for each image
+    uint64_t submit_queue[4]; // logical queue and sequence that schedule that present
+    uint64_t submit_seq[4];
+} win_t;
 FITS(win_t, NVNwindow);
 
 // Command buffer: commands are written into the command memory given by the game (AddCommandMemory), handle = segment start address; when it runs out, the game is called back for more memory
@@ -251,8 +272,6 @@ int mtl_snap_on(void); uint64_t mtl_snap_acquire_wait(void);   // present snapsh
 // Texture release (at Finalize)
 void mtl_tex_init(const tex_t *t);      // TextureInitialize: the serial belongs to a live texture object until mtl_tex_release
 void mtl_tex_release(tex_t *t);
-void mtl_tex_pin(uint64_t serial);
-void mtl_tex_unpin(uint64_t serial);
 void mtl_pkg_stats(uint64_t *uploads, uint64_t *reuploads);
 unsigned mtl_cpu_tex_count(void);   // live textures the CPU writes (retired snapshots are excluded)
 uint64_t mtl_pkg_edge_skips(void);   // packaged texture checks that found only writes beside the texture (pkg_edges_clean)
@@ -283,8 +302,6 @@ int prog_key(const prog_t *p, unsigned stage, uint8_t key[8]);
 void nvn_ctl_lens(const void *control, uint32_t *nctl, uint32_t *ncode);   // a control section's bytes in the shader key and its code area's length (NVN or NVN2), hle_nvn.c
 void mtl_reg_samp(int id, const samp_par *p);
 void mtl_prog_release(prog_t *p);
-void mtl_prog_unpin(prog_t *p); // submit lock held: release a queued descriptor or saved binding
-void mtl_prog_snapshot(prog_t *copy, const prog_t *source); // submit lock held: retain compiled shaders behind owned metadata
 void mtl_prog_prefetch(const prog_t *p);   // loads a new program's shader libraries in the background (nvn_mtl.m)
 void mtl_prog_forget(const prog_t *p);   // program finalize, submit lock held: drop it from every queue's bindings
 // New serial (> 0, globally increasing)
