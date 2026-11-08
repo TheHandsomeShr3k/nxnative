@@ -511,6 +511,9 @@ t_mesh_first_use: t_mesh_first_use.m $(MTL_T_DEP)
 check_t_mesh_first_use: t_mesh_first_use
 	DM_NVN_ENC_THREAD=0 MTL_DEBUG_LAYER=1 ./t_mesh_first_use
 	DM_NVN_ENC_THREAD=1 MTL_DEBUG_LAYER=1 ./t_mesh_first_use
+t_mesh_prewarm: t_mesh_prewarm.m $(MTL_T_DEP)
+	clang $(CFLAGS) -fobjc-arc -o $@ t_mesh_prewarm.m $(MTL_T_SRC) $(FW)
+check_t_mesh_prewarm: RUN_ENV = MTL_DEBUG_LAYER=1
 
 t_render_enable_queue: t_render_enable_queue.m $(MTL_T_DEP)
 	clang $(CFLAGS) -fobjc-arc -o $@ t_render_enable_queue.m $(filter-out ../nvn/hle_nvn.c,$(MTL_T_SRC)) $(FW)

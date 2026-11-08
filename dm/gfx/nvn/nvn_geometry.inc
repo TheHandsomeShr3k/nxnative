@@ -562,6 +562,20 @@ static id<MTLFunction> mtk_nop_fragment(void) {
         fn = [l newFunctionWithName:@"dm_mesh_nop"]; if (!fn) MLOG("[RED] the empty fragment function did not compile: %s", e.localizedDescription.UTF8String); });
     return fn;
 }
+// The pipeline of task shader ts (nil: none), mesh shader ms and pixel shader fs (nil: depth only) for key k (pso_key_fill's, with ms in the vertex place): pso_desc's pixel stage and
+// raster state, the mesh and object functions beside it. Any thread: the draw's (mtk_pso) and the prewarm's (warm_task's M rows, mesh_prewarm) are made by this one function
+static MTLMeshRenderPipelineDescriptor *mtk_desc(NvShader *ts, NvShader *ms, NvShader *fs, const pso_key *k) {
+    MTLRenderPipelineDescriptor *d = pso_desc(k, ms, fs, nil, 0);
+    MTLMeshRenderPipelineDescriptor *m = [MTLMeshRenderPipelineDescriptor new];
+    m.meshFunction = ms->fn; m.fragmentFunction = d.fragmentFunction ?: mtk_nop_fragment(); m.maxTotalThreadsPerMeshThreadgroup = ms->mesh_threads;
+    if (ts) { m.objectFunction = ts->fn; m.payloadMemoryLength = (ts->mesh_payload + 15u) & ~15u; m.maxTotalThreadsPerObjectThreadgroup = ts->mesh_threads; }
+    m.rasterSampleCount = d.rasterSampleCount; m.alphaToCoverageEnabled = d.alphaToCoverageEnabled;
+    for (int i = 0; i < 8; i++) m.colorAttachments[i] = d.colorAttachments[i];
+    m.depthAttachmentPixelFormat = d.depthAttachmentPixelFormat; m.stencilAttachmentPixelFormat = d.stencilAttachmentPixelFormat;
+    return m;
+}
+// A pipeline built here is counted with the others built on the submit thread (the long-frame log's "new pipelines") and recorded as an M row, the task key beside the pipeline's
+// key: the prewarm builds it at the next start and hands it to the draws (warm_task, warm_claim)
 static id<MTLRenderPipelineState> mtk_pso(NvProg *raster) {
     NvShader *ts = g_mtk.ts, *ms = g_mtk.ms, *fs = raster->sh[1];
     pso_key k; pso_key_fill(&k, ms, fs, g_pass.cfmt, g_pass.dfmt, g_pass.sfmt, g_pass.samples, 0);
@@ -569,16 +583,16 @@ static id<MTLRenderPipelineState> mtk_pso(NvProg *raster) {
     k.fsfn = (__bridge void *)(ts ? ts->fn : ms->fn);   // with ms in the key's vertex place: the task shader is the third of the pipeline's functions
     id ps = hm_get_id(&g_pso_mtk, &k);
     if (ps) return ps == NSNull.null ? nil : ps;
-    MTLRenderPipelineDescriptor *d = pso_desc(&k, ms, fs, nil, 0);
-    MTLMeshRenderPipelineDescriptor *m = [MTLMeshRenderPipelineDescriptor new];
-    m.meshFunction = ms->fn; m.fragmentFunction = d.fragmentFunction ?: mtk_nop_fragment(); m.maxTotalThreadsPerMeshThreadgroup = ms->mesh_threads;
-    if (ts) { m.objectFunction = ts->fn; m.payloadMemoryLength = (ts->mesh_payload + 15u) & ~15u; m.maxTotalThreadsPerObjectThreadgroup = ts->mesh_threads; }
-    m.rasterSampleCount = d.rasterSampleCount; m.alphaToCoverageEnabled = d.alphaToCoverageEnabled;
-    for (int i = 0; i < 8; i++) m.colorAttachments[i] = d.colorAttachments[i];
-    m.depthAttachmentPixelFormat = d.depthAttachmentPixelFormat; m.stencilAttachmentPixelFormat = d.stencilAttachmentPixelFormat;
+    MTLMeshRenderPipelineDescriptor *m = mtk_desc(ts, ms, fs, &k);
     NSError *e = nil; uint64_t t0 = bp_now();
     id<MTLRenderPipelineState> p = [g_dev newRenderPipelineStateWithMeshDescriptor:m options:MTLPipelineOptionNone reflection:nil error:&e];
-    MLOG("%stask / mesh pipeline: task %s mesh %s fragment %s, %.1f ms%s%s", p ? "" : "[RED] ", ts ? ts->key : "-", ms->key, fs ? fs->key : "-", (bp_now() - t0) / 1e6, p ? "" : ": ", p ? "" : e.localizedDescription.UTF8String);
+    uint64_t dt = bp_now() - t0; g_bp_pso_n++; g_bp_pso_ns += dt;
+    MLOG("%stask / mesh pipeline: task %s mesh %s fragment %s, %.1f ms%s%s", p ? "" : "[RED] ", ts ? ts->key : "-", ms->key, fs ? fs->key : "-", dt / 1e6, p ? "" : ": ", p ? "" : e.localizedDescription.UTF8String);
+    if (p) {   // the row's key without the function pointer: pso_skey_from takes a set fsfn for a specialized fragment
+        pso_key rk = k; rk.fsfn = NULL; pso_skey sk; char shex[sizeof sk * 2 + 1];
+        pso_skey_from(&rk, ms, fs, 0, NULL, &sk); pso_skey_hex(&sk, shex);
+        pso_record("M\t%s\t%s\n", ts ? ts->key : "-", shex); pso_user_record("M\t%s\t%s\n", ts ? ts->key : "-", shex);
+    }
     hm_put_id(&g_pso_mtk, &k, p ?: NSNull.null);
     return p;
 }
